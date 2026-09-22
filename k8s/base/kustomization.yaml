@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base manifests for the sample service. Environment-specific values
+# (replicas, resources, namespace, image registry and tag) live in overlays/.
+# The container image is referenced by the bare name `sample-service`; each
+# overlay (and CI via `kustomize edit set image`) resolves it to a registry path.
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: sample-service
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: devsecops-pipeline
+      app.kubernetes.io/managed-by: kustomize
+
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml

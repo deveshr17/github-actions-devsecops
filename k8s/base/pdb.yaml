@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sample-service
+  labels:
+    app.kubernetes.io/component: api
+spec:
+  # Always keep at least one replica available during node drains/upgrades.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: api

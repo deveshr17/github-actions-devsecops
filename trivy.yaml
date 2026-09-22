@@ -1,0 +1,35 @@
+# Trivy configuration shared by the fs, image and config scans.
+# Individual workflow steps may override `format` and `exit-code` in order to
+# emit SARIF (exit 0) and then enforce the gate (exit 1) separately.
+severity:
+  - CRITICAL
+  - HIGH
+
+# Fail the step when any finding at the configured severities remains.
+exit-code: 1
+
+# Findings without an upstream fix cannot be remediated by rebuilding; they are
+# still visible in code scanning (SARIF) but do not block delivery.
+ignore-unfixed: true
+
+# Vulnerabilities, leaked secrets and IaC/Dockerfile misconfigurations.
+scanners:
+  - vuln
+  - secret
+  - misconfig
+
+vulnerability:
+  type:
+    - os
+    - library
+
+# Suppressions with justification live in .trivyignore (see policy there).
+ignorefile: .trivyignore
+
+timeout: 10m
+
+# Keep noise down: local scratch directories are never scanned.
+skip-dirs:
+  - app/node_modules
+  - app/coverage
+  - .git

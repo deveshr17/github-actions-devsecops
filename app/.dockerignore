@@ -1,0 +1,16 @@
+# Keep the build context minimal and free of secrets.
+node_modules
+npm-debug.log*
+coverage
+.nyc_output
+*.test.js
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.github
+Dockerfile
+.dockerignore
+README.md
+*.md

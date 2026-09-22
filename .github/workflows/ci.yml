@@ -1,0 +1,269 @@
+name: CI
+
+# Runs on every pull request and on pushes to main. Nothing here pushes an
+# image or touches a cluster; CD is a separate workflow so that its stricter
+# permissions and environment gates never bleed into PR builds from forks.
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+  APP_DIR: app
+  IMAGE_LOCAL: sample-service:ci-${{ github.sha }}
+
+jobs:
+  lint-test:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ${{ env.APP_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+
+      - name: Install dependencies (npm ci)
+        run: npm ci --ignore-scripts
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests with coverage
+        run: npm run test:ci
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: ${{ env.APP_DIR }}/coverage/lcov.info
+          retention-days: 7
+          if-no-files-found: error
+
+  sonarcloud:
+    name: SonarCloud analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: lint-test
+    # SonarCloud needs SONAR_TOKEN; skip on forked PRs where secrets are unavailable.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout (full history for blame/new-code detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: ${{ env.APP_DIR }}/coverage
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+
+      - name: Wait for quality gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+
+  trivy-fs:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pass 1: produce SARIF for code scanning regardless of findings.
+      - name: Trivy fs scan (SARIF report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          trivy-config: trivy.yaml
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "0"
+
+      - name: Upload Trivy fs SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      # Pass 2: enforce the policy. Uses the DB cached by pass 1.
+      - name: Trivy fs scan (policy gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          trivy-config: trivy.yaml
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          skip-setup-trivy: true
+
+  hadolint:
+    name: Dockerfile lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ env.APP_DIR }}/Dockerfile
+          config: .hadolint.yaml
+          format: sarif
+          output-file: hadolint.sarif
+          failure-threshold: warning
+
+      - name: Upload hadolint SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint
+
+  build-and-scan-image:
+    name: Build image and Trivy image scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint-test, hadolint]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.APP_DIR }}
+          file: ${{ env.APP_DIR }}/Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_LOCAL }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            VERSION=ci-${{ github.run_number }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container smoke test (start, probe, graceful SIGTERM)
+        run: |
+          set -euo pipefail
+          cid=$(docker run -d --rm -p 18080:8080 --read-only --cap-drop ALL \
+                  --security-opt no-new-privileges "$IMAGE_LOCAL")
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:18080/healthz
+          curl -fsS http://127.0.0.1:18080/readyz
+          curl -fsS http://127.0.0.1:18080/api/v1/hello
+          curl -fsS http://127.0.0.1:18080/metrics | grep -q '^http_requests_total'
+          user=$(docker inspect --format '{{.Config.User}}' "$IMAGE_LOCAL")
+          test "$user" = "65532:65532" || { echo "image does not run as uid 65532 (got '$user')"; exit 1; }
+          # SIGTERM should drain and exit 0 within the grace period.
+          docker stop -t 30 "$cid" >/dev/null
+          echo "container smoke test passed"
+
+      - name: Trivy image scan (SARIF report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_LOCAL }}
+          trivy-config: trivy.yaml
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "0"
+
+      - name: Upload Trivy image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Trivy image scan (policy gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_LOCAL }}
+          trivy-config: trivy.yaml
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          skip-setup-trivy: true
+
+  ci-status:
+    # Single required status check for branch protection.
+    name: CI status
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [lint-test, sonarcloud, trivy-fs, hadolint, build-and-scan-image]
+    if: always()
+    steps:
+      - name: Evaluate upstream job results
+        run: |
+          set -euo pipefail
+          echo "lint-test:            ${{ needs.lint-test.result }}"
+          echo "sonarcloud:           ${{ needs.sonarcloud.result }}"
+          echo "trivy-fs:             ${{ needs.trivy-fs.result }}"
+          echo "hadolint:             ${{ needs.hadolint.result }}"
+          echo "build-and-scan-image: ${{ needs.build-and-scan-image.result }}"
+          for r in "${{ needs.lint-test.result }}" "${{ needs.trivy-fs.result }}" \
+                   "${{ needs.hadolint.result }}" "${{ needs.build-and-scan-image.result }}"; do
+            [ "$r" = "success" ] || { echo "a required job did not succeed"; exit 1; }
+          done
+          # SonarCloud is skipped (not failed) on forked PRs.
+          case "${{ needs.sonarcloud.result }}" in
+            success|skipped) ;;
+            *) echo "sonarcloud gate failed"; exit 1 ;;
+          esac

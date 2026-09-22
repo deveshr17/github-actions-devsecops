@@ -1,0 +1,80 @@
+name: CD
+
+# Build once, promote the same digest through UAT and production.
+#   push to main  -> build -> deploy uat (auto) -> [approval] -> deploy production
+#   push tag v*   -> same flow; the image additionally receives semver tags
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+permissions:
+  contents: read
+
+# One release train at a time per ref; never cancel a deploy mid-flight.
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-push:
+    name: Build and push image
+    uses: ./.github/workflows/reusable-docker-build-push.yml
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+    with:
+      image_name: sample-service
+      registry: ${{ vars.ARTIFACT_REGISTRY_HOST || 'asia-south1-docker.pkg.dev' }}
+      repository: ${{ vars.ARTIFACT_REGISTRY_REPO || 'apps' }}
+      context: ./app
+      dockerfile: ./app/Dockerfile
+    secrets:
+      WIF_PROVIDER: ${{ secrets.WIF_PROVIDER }}
+      WIF_SERVICE_ACCOUNT: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+  deploy-uat:
+    name: Deploy UAT
+    needs: build-push
+    uses: ./.github/workflows/reusable-deploy-gke.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: uat
+      cluster: ${{ vars.GKE_CLUSTER_UAT }}
+      location: ${{ vars.GKE_LOCATION }}
+      namespace: sample-service-uat
+      overlay: k8s/overlays/uat
+      image: ${{ needs.build-push.outputs.image }}
+      digest: ${{ needs.build-push.outputs.digest }}
+      tag: ${{ needs.build-push.outputs.tag }}
+    # Environment-scoped secrets for `uat` are resolved inside the called job.
+    secrets: inherit
+
+  deploy-production:
+    name: Deploy production
+    needs: [build-push, deploy-uat]
+    # Approval gate: the `production` environment requires reviewers
+    # (configured in GitHub UI, see docs/github-environments-setup.md).
+    uses: ./.github/workflows/reusable-deploy-gke.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: production
+      cluster: ${{ vars.GKE_CLUSTER_PROD }}
+      location: ${{ vars.GKE_LOCATION }}
+      namespace: sample-service-prod
+      overlay: k8s/overlays/prod
+      # Promotion, not rebuild: exactly the digest that passed UAT.
+      image: ${{ needs.build-push.outputs.image }}
+      digest: ${{ needs.build-push.outputs.digest }}
+      tag: ${{ needs.build-push.outputs.tag }}
+      rollout_timeout: 10m
+    secrets: inherit

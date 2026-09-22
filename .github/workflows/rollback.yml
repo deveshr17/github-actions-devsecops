@@ -1,0 +1,189 @@
+name: Rollback
+
+# Manual rollback for one environment. Two modes:
+#   target = previous          -> kubectl rollout undo (previous ReplicaSet)
+#   target = <tag or digest>   -> resolve in Artifact Registry and redeploy
+# Every rollback is annotated on the Deployment (change-cause) with the actor,
+# reason and run id so `kubectl rollout history` is an audit trail.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to roll back
+        required: true
+        type: choice
+        options: [uat, production]
+      target:
+        description: "'previous', an image tag (sha-abc1234, v1.2.3) or a digest (sha256:...)"
+        required: true
+        type: string
+        default: previous
+      reason:
+        description: Why this rollback is being performed (recorded on the Deployment)
+        required: true
+        type: string
+      run_smoke_test:
+        description: Run the in-cluster smoke test after rollback
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-${{ inputs.environment }}-rollback
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Rollback ${{ inputs.environment }} to ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEPLOY: sample-service
+      IMAGE_NAME: sample-service
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve environment settings
+        id: env
+        run: |
+          set -euo pipefail
+          case "${{ inputs.environment }}" in
+            uat)
+              echo "namespace=sample-service-uat" >> "$GITHUB_OUTPUT"
+              echo "cluster=${{ vars.GKE_CLUSTER_UAT }}" >> "$GITHUB_OUTPUT"
+              ;;
+            production)
+              echo "namespace=sample-service-prod" >> "$GITHUB_OUTPUT"
+              echo "cluster=${{ vars.GKE_CLUSTER_PROD }}" >> "$GITHUB_OUTPUT"
+              ;;
+            *) echo "unknown environment"; exit 1 ;;
+          esac
+          echo "image=${{ vars.ARTIFACT_REGISTRY_HOST || 'asia-south1-docker.pkg.dev' }}/${{ secrets.GCP_PROJECT_ID }}/${{ vars.ARTIFACT_REGISTRY_REPO || 'apps' }}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud (OIDC / WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ steps.env.outputs.cluster }}
+          location: ${{ vars.GKE_LOCATION }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Capture state before rollback
+        id: before
+        env:
+          NS: ${{ steps.env.outputs.namespace }}
+        run: |
+          set -euo pipefail
+          echo "::group::Rollout history"
+          kubectl -n "$NS" rollout history deploy/"$DEPLOY"
+          echo "::endgroup::"
+          rev=$(kubectl -n "$NS" get deploy "$DEPLOY" -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}')
+          img=$(kubectl -n "$NS" get deploy "$DEPLOY" -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "revision=${rev}" >> "$GITHUB_OUTPUT"
+          echo "image=${img}" >> "$GITHUB_OUTPUT"
+          echo "before: revision ${rev}, image ${img}"
+
+      - name: Rollback to previous revision
+        if: inputs.target == 'previous'
+        env:
+          NS: ${{ steps.env.outputs.namespace }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" rollout undo deploy/"$DEPLOY"
+
+      - name: Resolve tag or digest in Artifact Registry
+        id: resolve
+        if: inputs.target != 'previous'
+        env:
+          IMAGE: ${{ steps.env.outputs.image }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          if echo "$TARGET" | grep -Eq '^sha256:[a-f0-9]{64}$'; then
+            digest="$TARGET"
+          else
+            # Only tags that already exist in the registry can be rolled back to.
+            digest=$(gcloud artifacts docker images describe "${IMAGE}:${TARGET}" \
+                       --format='value(image_summary.digest)')
+          fi
+          [ -n "$digest" ] || { echo "could not resolve ${TARGET} to a digest"; exit 1; }
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "resolved ${TARGET} -> ${digest}"
+
+      - name: Redeploy resolved digest
+        if: inputs.target != 'previous'
+        env:
+          NS: ${{ steps.env.outputs.namespace }}
+          IMAGE_REF: ${{ steps.env.outputs.image }}@${{ steps.resolve.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Only the image changes; the rest of the manifest stays as currently applied.
+          kubectl -n "$NS" set image deploy/"$DEPLOY" app="${IMAGE_REF}"
+
+      - name: Annotate change cause
+        env:
+          NS: ${{ steps.env.outputs.namespace }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" annotate deploy "$DEPLOY" --overwrite \
+            kubernetes.io/change-cause="ROLLBACK to ${{ inputs.target }} by ${GITHUB_ACTOR} run ${GITHUB_RUN_ID}: ${{ inputs.reason }}"
+
+      - name: Wait for rollout
+        env:
+          NS: ${{ steps.env.outputs.namespace }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" rollout status deploy/"$DEPLOY" --timeout=5m
+
+      - name: In-cluster smoke test
+        if: inputs.run_smoke_test
+        env:
+          NS: ${{ steps.env.outputs.namespace }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" delete job sample-service-smoke --ignore-not-found --wait=true
+          kubectl -n "$NS" apply -f k8s/smoke-test-job.yaml
+          for i in $(seq 1 60); do
+            succeeded=$(kubectl -n "$NS" get job sample-service-smoke -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+            failed=$(kubectl -n "$NS" get job sample-service-smoke -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
+            if [ "${succeeded:-0}" -ge 1 ]; then kubectl -n "$NS" logs job/sample-service-smoke || true; exit 0; fi
+            if [ "${failed:-0}" -ge 1 ]; then kubectl -n "$NS" logs job/sample-service-smoke || true; exit 1; fi
+            sleep 3
+          done
+          echo "smoke test timed out"; exit 1
+
+      - name: Rollback summary
+        if: always()
+        env:
+          NS: ${{ steps.env.outputs.namespace }}
+        run: |
+          after_img=$(kubectl -n "$NS" get deploy "$DEPLOY" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+          after_rev=$(kubectl -n "$NS" get deploy "$DEPLOY" -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null || echo "unknown")
+          {
+            echo "### Rollback ${{ inputs.environment }}: ${{ job.status }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Requested by | ${GITHUB_ACTOR} |"
+            echo "| Reason | ${{ inputs.reason }} |"
+            echo "| Target | \`${{ inputs.target }}\` |"
+            echo "| Before | revision ${{ steps.before.outputs.revision }}, \`${{ steps.before.outputs.image }}\` |"
+            echo "| After | revision ${after_rev}, \`${after_img}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

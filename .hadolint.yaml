@@ -1,0 +1,16 @@
+# hadolint configuration for app/Dockerfile.
+failure-threshold: warning
+trustedRegistries:
+  - docker.io
+  - gcr.io
+ignored:
+  # DL3018/DL3008 concern apk/apt pinning; the runtime is distroless and the
+  # build stage installs nothing via the OS package manager.
+  - DL3018
+  - DL3008
+override:
+  error:
+    - DL3002   # last USER must not be root
+    - DL3020   # use COPY instead of ADD
+  warning:
+    - DL3059   # consecutive RUN instructions

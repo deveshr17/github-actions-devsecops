@@ -1,0 +1,13 @@
+# Trivy suppression list.
+#
+# Policy:
+#   - This file is intentionally empty by default. CRITICAL and HIGH findings
+#     with an available fix block the pipeline (see trivy.yaml).
+#   - A CVE may only be added here when (a) it is confirmed not reachable in
+#     this workload and (b) the entry carries an owner, a justification and an
+#     expiry date. Entries past their expiry are removed and the finding must
+#     be re-triaged.
+#   - Changes to this file require CODEOWNERS review.
+#
+# Format:
+#   CVE-2024-XXXXX   # owner: @handle, exp: 2026-12-31, reason: <why not exploitable here>

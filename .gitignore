@@ -1,0 +1,38 @@
+# Node
+node_modules/
+npm-debug.log*
+coverage/
+.nyc_output/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.p12
+*.json.key
+kubeconfig
+kubeconfig.*
+.kube/
+
+# Terraform (if added alongside)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# Scan and build output
+*.sarif
+rendered.yaml
+.scannerwork/
+trivy-*.txt
+dist/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

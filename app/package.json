@@ -1,0 +1,23 @@
+{
+  "name": "devsecops-sample-service",
+  "version": "1.0.0",
+  "description": "Small Express service used to demonstrate an end-to-end DevSecOps pipeline on GitHub Actions and GKE.",
+  "private": true,
+  "license": "MIT",
+  "author": "Devesh Rashinkar",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info 'src/**/*.test.js'",
+    "test:ci": "mkdir -p coverage && npm test",
+    "lint": "node scripts/lint.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "prom-client": "^15.1.3"
+  }
+}

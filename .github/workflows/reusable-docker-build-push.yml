@@ -1,0 +1,225 @@
+name: Reusable - Docker build and push
+
+# Builds a multi-stage image, pushes it to Artifact Registry using OIDC
+# (Workload Identity Federation, no JSON keys), attaches SBOM and SLSA
+# provenance attestations, scans the pushed image, and returns the immutable
+# digest for downstream deploy jobs.
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: Image name inside the Artifact Registry repository (e.g. sample-service)
+        required: true
+        type: string
+      registry:
+        description: Artifact Registry host (e.g. asia-south1-docker.pkg.dev)
+        required: true
+        type: string
+      repository:
+        description: Artifact Registry repository name (e.g. apps)
+        required: true
+        type: string
+      context:
+        description: Docker build context
+        required: false
+        type: string
+        default: ./app
+      dockerfile:
+        description: Path to the Dockerfile
+        required: false
+        type: string
+        default: ./app/Dockerfile
+      platforms:
+        description: Target platforms
+        required: false
+        type: string
+        default: linux/amd64
+      scan_pushed_image:
+        description: Run Trivy against the pushed image and fail on CRITICAL/HIGH
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      WIF_PROVIDER:
+        description: Full resource name of the Workload Identity Provider
+        required: true
+      WIF_SERVICE_ACCOUNT:
+        description: Email of the GCP service account to impersonate
+        required: true
+      GCP_PROJECT_ID:
+        description: GCP project that hosts the Artifact Registry repository
+        required: true
+    outputs:
+      image:
+        description: Fully-qualified image name without tag or digest
+        value: ${{ jobs.build-push.outputs.image }}
+      digest:
+        description: Image manifest digest (sha256:...)
+        value: ${{ jobs.build-push.outputs.digest }}
+      tag:
+        description: Primary immutable tag (sha-<short>)
+        value: ${{ jobs.build-push.outputs.tag }}
+      image_ref:
+        description: image@digest reference to deploy
+        value: ${{ jobs.build-push.outputs.image_ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-push:
+    name: Build and push ${{ inputs.image_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write        # OIDC token for Workload Identity Federation
+      security-events: write # SARIF upload for the pushed-image scan
+    outputs:
+      image: ${{ steps.names.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+      tag: ${{ steps.names.outputs.tag }}
+      image_ref: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image names
+        id: names
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          REPOSITORY: ${{ inputs.repository }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}"
+          short_sha="${GITHUB_SHA::7}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-${short_sha}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to Google Cloud (OIDC / WIF)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 1200s
+
+      - name: Log in to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Set up QEMU
+        if: inputs.platforms != 'linux/amd64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata (tags and OCI labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.names.outputs.image }}
+          # Tagging strategy (see docs/image-tagging-strategy.md):
+          #   sha-<short>      always; the immutable build identity
+          #   <semver>, <maj.min>  on v* tags
+          #   <branch>         moving pointer for humans; never used for deploys
+          # `latest` is deliberately never produced.
+          flavor: |
+            latest=false
+          tags: |
+            type=sha,prefix=sha-,format=short,priority=1000
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.title=${{ inputs.image_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.names.outputs.version }}
+            org.opencontainers.image.created=${{ steps.names.outputs.build_date }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ steps.names.outputs.version }}
+            BUILD_DATE=${{ steps.names.outputs.build_date }}
+          # SLSA provenance + SPDX SBOM are stored alongside the image manifest.
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan of pushed image (SARIF report)
+        if: inputs.scan_pushed_image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
+          trivy-config: trivy.yaml
+          format: sarif
+          output: trivy-pushed-image.sarif
+          exit-code: "0"
+        env:
+          # Trivy authenticates to Artifact Registry with the same short-lived token.
+          TRIVY_USERNAME: oauth2accesstoken
+          TRIVY_PASSWORD: ${{ steps.auth.outputs.access_token }}
+
+      - name: Upload Trivy SARIF
+        if: inputs.scan_pushed_image && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-pushed-image.sarif
+          category: trivy-pushed-image
+
+      - name: Trivy scan of pushed image (policy gate)
+        if: inputs.scan_pushed_image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
+          trivy-config: trivy.yaml
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          skip-setup-trivy: true
+        env:
+          TRIVY_USERNAME: oauth2accesstoken
+          TRIVY_PASSWORD: ${{ steps.auth.outputs.access_token }}
+
+      - name: Build summary
+        run: |
+          {
+            echo "### Image published"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Image | \`${{ steps.names.outputs.image }}\` |"
+            echo "| Digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| Primary tag | \`${{ steps.names.outputs.tag }}\` |"
+            echo "| All tags | \`$(echo '${{ steps.meta.outputs.tags }}' | tr '\n' ' ')\` |"
+            echo "| Attestations | SLSA provenance (mode=max), SPDX SBOM |"
+          } >> "$GITHUB_STEP_SUMMARY"

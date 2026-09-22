@@ -1,0 +1,115 @@
+name: PR validation
+
+# Fast, cluster-free checks that run on every PR event: conventional commit
+# title, workflow lint, Kustomize render, and schema validation with kubeconform.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  KUBECONFORM_VERSION: v0.6.7
+  KUBERNETES_VERSION: 1.30.0
+
+jobs:
+  pr-title:
+    name: Conventional commit title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Validate PR title
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            chore
+            docs
+            refactor
+            perf
+            test
+            ci
+            build
+            revert
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" must start with a lowercase letter.
+
+  actionlint:
+    name: Workflow lint (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+        with:
+          fail-on-error: true
+
+  kustomize-validate:
+    name: Kustomize build and kubeconform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        overlay: [uat, prod]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.4
+
+      - name: Install kubeconform
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            -o kubeconform.tar.gz
+          tar -xzf kubeconform.tar.gz kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+
+      - name: Render and validate overlay
+        run: |
+          set -euo pipefail
+          scripts/kustomize-validate.sh "k8s/overlays/${{ matrix.overlay }}"
+
+      - name: Validate smoke-test Job manifest
+        run: |
+          set -euo pipefail
+          kubeconform -strict -summary -kubernetes-version "${KUBERNETES_VERSION}" k8s/smoke-test-job.yaml
+
+  policy-checks:
+    name: Manifest policy checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy Kubernetes misconfiguration scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: k8s
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          # Namespace and Kustomization files trigger irrelevant checks.
+          skip-files: "k8s/base/kustomization.yaml,k8s/overlays/uat/kustomization.yaml,k8s/overlays/prod/kustomization.yaml"

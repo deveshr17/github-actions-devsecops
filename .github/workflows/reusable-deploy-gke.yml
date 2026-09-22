@@ -1,0 +1,235 @@
+name: Reusable - Deploy to GKE
+
+# Deploys an immutable image digest to a GKE cluster with Kustomize, waits for
+# the rollout, runs an in-cluster smoke test, and rolls back automatically if
+# either step fails. The calling job's `environment` provides approval gates
+# and environment-scoped secrets.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment name (uat | production)
+        required: true
+        type: string
+      cluster:
+        description: GKE cluster name
+        required: true
+        type: string
+      location:
+        description: GKE cluster location (region or zone)
+        required: true
+        type: string
+      namespace:
+        description: Target Kubernetes namespace
+        required: true
+        type: string
+      overlay:
+        description: Kustomize overlay directory
+        required: true
+        type: string
+      image:
+        description: Fully-qualified image name (no tag/digest)
+        required: true
+        type: string
+      digest:
+        description: Image digest to deploy (sha256:...)
+        required: true
+        type: string
+      tag:
+        description: Human-readable tag for annotations/summary (e.g. sha-abc1234)
+        required: false
+        type: string
+        default: ""
+      deployment_name:
+        description: Deployment to watch and (if needed) roll back
+        required: false
+        type: string
+        default: sample-service
+      rollout_timeout:
+        description: kubectl rollout status timeout
+        required: false
+        type: string
+        default: 5m
+      run_smoke_test:
+        description: Run the in-cluster smoke test Job after rollout
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      WIF_PROVIDER:
+        required: true
+      WIF_SERVICE_ACCOUNT:
+        required: true
+      GCP_PROJECT_ID:
+        required: true
+    outputs:
+      previous_revision:
+        description: Deployment revision that was live before this deploy
+        value: ${{ jobs.deploy.outputs.previous_revision }}
+      new_revision:
+        description: Deployment revision after this deploy
+        value: ${{ jobs.deploy.outputs.new_revision }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NS: ${{ inputs.namespace }}
+      DEPLOY: ${{ inputs.deployment_name }}
+      IMAGE_REF: ${{ inputs.image }}@${{ inputs.digest }}
+    outputs:
+      previous_revision: ${{ steps.pre.outputs.revision }}
+      new_revision: ${{ steps.post.outputs.revision }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate digest format
+        run: |
+          set -euo pipefail
+          echo "${{ inputs.digest }}" | grep -Eq '^sha256:[a-f0-9]{64}$' \
+            || { echo "refusing to deploy: '${{ inputs.digest }}' is not an immutable digest"; exit 1; }
+
+      - name: Authenticate to Google Cloud (OIDC / WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ inputs.cluster }}
+          location: ${{ inputs.location }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          # For private clusters without a public endpoint enable Connect Gateway:
+          # use_connect_gateway: true
+
+      - name: Set up kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: "5.4.3"
+
+      - name: Record current revision (for rollback)
+        id: pre
+        run: |
+          set -euo pipefail
+          rev=$(kubectl -n "$NS" get deploy "$DEPLOY" \
+                  -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null || true)
+          img=$(kubectl -n "$NS" get deploy "$DEPLOY" \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+          echo "revision=${rev:-0}" >> "$GITHUB_OUTPUT"
+          echo "image=${img:-none}" >> "$GITHUB_OUTPUT"
+          echo "current revision: ${rev:-0}, image: ${img:-none}"
+
+      - name: Pin image digest in overlay
+        working-directory: ${{ inputs.overlay }}
+        run: |
+          set -euo pipefail
+          kustomize edit set image "sample-service=${IMAGE_REF}"
+          echo "--- rendered image reference:"
+          kustomize build . | grep -E '^\s+image:' | sort -u
+
+      - name: Render and validate manifests
+        run: |
+          set -euo pipefail
+          kustomize build "${{ inputs.overlay }}" > rendered.yaml
+          kubectl apply -k "${{ inputs.overlay }}" --dry-run=server
+
+      - name: Apply manifests
+        id: apply
+        run: |
+          set -euo pipefail
+          kubectl apply -k "${{ inputs.overlay }}"
+          kubectl -n "$NS" annotate deploy "$DEPLOY" --overwrite \
+            kubernetes.io/change-cause="deploy ${{ inputs.tag || inputs.digest }} (${GITHUB_SHA::7}) by ${GITHUB_ACTOR} run ${GITHUB_RUN_ID}"
+
+      - name: Wait for rollout
+        id: rollout
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" rollout status deploy/"$DEPLOY" --timeout="${{ inputs.rollout_timeout }}"
+
+      - name: In-cluster smoke test
+        id: smoke
+        if: inputs.run_smoke_test
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" delete job sample-service-smoke --ignore-not-found --wait=true
+          kubectl -n "$NS" apply -f k8s/smoke-test-job.yaml
+          # Poll instead of `kubectl wait --for=condition=complete` so a Failed job
+          # exits promptly rather than after the full timeout.
+          for i in $(seq 1 60); do
+            succeeded=$(kubectl -n "$NS" get job sample-service-smoke -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+            failed=$(kubectl -n "$NS" get job sample-service-smoke -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
+            if [ "${succeeded:-0}" -ge 1 ]; then
+              kubectl -n "$NS" logs job/sample-service-smoke || true
+              echo "smoke test passed"; exit 0
+            fi
+            if [ "${failed:-0}" -ge 1 ]; then
+              kubectl -n "$NS" logs job/sample-service-smoke || true
+              echo "smoke test failed"; exit 1
+            fi
+            sleep 3
+          done
+          echo "smoke test timed out"; exit 1
+
+      - name: Record new revision
+        id: post
+        run: |
+          set -euo pipefail
+          rev=$(kubectl -n "$NS" get deploy "$DEPLOY" \
+                  -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}')
+          echo "revision=${rev}" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Automatic rollback: only if we actually applied something and either
+      # the rollout or the smoke test failed. `kubectl rollout undo` returns
+      # the Deployment to the previous ReplicaSet (previous image digest).
+      # ---------------------------------------------------------------------
+      - name: Automatic rollback on failure
+        if: failure() && steps.apply.outcome == 'success' && steps.pre.outputs.revision != '0'
+        run: |
+          set -euo pipefail
+          echo "::error::Deploy to ${{ inputs.environment }} failed; rolling back ${DEPLOY} in ${NS}"
+          kubectl -n "$NS" rollout undo deploy/"$DEPLOY" --to-revision="${{ steps.pre.outputs.revision }}"
+          kubectl -n "$NS" annotate deploy "$DEPLOY" --overwrite \
+            kubernetes.io/change-cause="AUTO-ROLLBACK to revision ${{ steps.pre.outputs.revision }} after failed deploy of ${{ inputs.tag || inputs.digest }} run ${GITHUB_RUN_ID}"
+          kubectl -n "$NS" rollout status deploy/"$DEPLOY" --timeout="${{ inputs.rollout_timeout }}"
+          echo "rollback complete: now serving ${{ steps.pre.outputs.image }}"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "::group::Deployment"; kubectl -n "$NS" describe deploy "$DEPLOY" || true; echo "::endgroup::"
+          echo "::group::Pods"; kubectl -n "$NS" get pods -o wide || true; echo "::endgroup::"
+          echo "::group::Events"; kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -50 || true; echo "::endgroup::"
+          echo "::group::Rollout history"; kubectl -n "$NS" rollout history deploy/"$DEPLOY" || true; echo "::endgroup::"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy to ${{ inputs.environment }}: ${{ job.status }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Cluster | \`${{ inputs.cluster }}\` (${{ inputs.location }}) |"
+            echo "| Namespace | \`${NS}\` |"
+            echo "| Image | \`${IMAGE_REF}\` |"
+            echo "| Tag | \`${{ inputs.tag }}\` |"
+            echo "| Previous revision | ${{ steps.pre.outputs.revision }} (\`${{ steps.pre.outputs.image }}\`) |"
+            echo "| New revision | ${{ steps.post.outputs.revision || 'n/a' }} |"
+            echo "| Rollout | ${{ steps.rollout.outcome }} |"
+            echo "| Smoke test | ${{ steps.smoke.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

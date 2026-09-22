@@ -1,0 +1,6 @@
+# Changes to delivery-critical paths require review from the platform owner.
+/.github/workflows/   @deveshr17
+/k8s/                 @deveshr17
+/app/Dockerfile       @deveshr17
+/trivy.yaml           @deveshr17
+/.trivyignore         @deveshr17

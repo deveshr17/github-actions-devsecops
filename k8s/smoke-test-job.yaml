@@ -1,0 +1,64 @@
+# One-shot in-cluster smoke test launched by reusable-deploy-gke.yml after
+# `kubectl rollout status` succeeds. It exercises the Service (not a single
+# pod) so it validates Service selectors, NetworkPolicy and readiness gating.
+# The namespace is set with `kubectl apply -n` by the workflow.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sample-service-smoke
+  labels:
+    app.kubernetes.io/name: sample-service
+    app.kubernetes.io/component: smoke-test
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sample-service
+        app.kubernetes.io/component: smoke-test
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: smoke
+          image: curlimages/curl:8.10.1
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              BASE="http://sample-service.${TARGET_NAMESPACE}.svc.cluster.local"
+              for path in /healthz /readyz /api/v1/hello; do
+                code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${BASE}${path}")
+                echo "${path} -> ${code}"
+                [ "${code}" = "200" ] || { echo "smoke test failed on ${path}"; exit 1; }
+              done
+              curl -sS --max-time 5 "${BASE}/api/v1/hello" | grep -q '"message"' || exit 1
+              echo "smoke test passed"
+          env:
+            - name: TARGET_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault

@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sample-service-prod
+
+resources:
+  - ../../base
+  - namespace.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/instance: sample-service-prod
+      app.kubernetes.io/environment: production
+
+patches:
+  - path: deployment-patch.yaml
+    target:
+      kind: Deployment
+      name: sample-service
+  - path: hpa-patch.yaml
+    target:
+      kind: HorizontalPodAutoscaler
+      name: sample-service
+  - path: pdb-patch.yaml
+    target:
+      kind: PodDisruptionBudget
+      name: sample-service
+
+configMapGenerator:
+  - name: sample-service-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=info
+      - ENVIRONMENT=production
+
+# Image is pinned by digest in CI; this tag is only a placeholder so that
+# `kustomize build` works locally.
+images:
+  - name: sample-service
+    newName: asia-south1-docker.pkg.dev/example-project-prod/apps/sample-service
+    newTag: sha-0000000

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sample-service-config
+  labels:
+    app.kubernetes.io/component: api
+data:
+  SERVICE_NAME: sample-service
+  PORT: "8080"
+  # Wait for the endpoint controller to remove the pod before closing sockets.
+  DRAIN_DELAY_MS: "5000"
+  SHUTDOWN_TIMEOUT_MS: "25000"
+  LOG_LEVEL: info
