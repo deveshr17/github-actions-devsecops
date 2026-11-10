@@ -82,7 +82,7 @@ jobs:
       image_ref: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Compute image names
         id: names
@@ -106,7 +106,7 @@ jobs:
 
       - name: Authenticate to Google Cloud (OIDC / WIF)
         id: auth
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
@@ -114,7 +114,7 @@ jobs:
           access_token_lifetime: 1200s
 
       - name: Log in to Artifact Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ inputs.registry }}
           username: oauth2accesstoken
@@ -122,14 +122,14 @@ jobs:
 
       - name: Set up QEMU
         if: inputs.platforms != 'linux/amd64'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Docker metadata (tags and OCI labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ steps.names.outputs.image }}
           # Tagging strategy (see docs/image-tagging-strategy.md):
@@ -154,7 +154,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
@@ -174,7 +174,7 @@ jobs:
 
       - name: Trivy scan of pushed image (SARIF report)
         if: inputs.scan_pushed_image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
@@ -189,14 +189,14 @@ jobs:
 
       - name: Upload Trivy SARIF
         if: inputs.scan_pushed_image && always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-pushed-image.sarif
           category: trivy-pushed-image
 
       - name: Trivy scan of pushed image (policy gate)
         if: inputs.scan_pushed_image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
